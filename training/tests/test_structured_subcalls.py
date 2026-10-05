@@ -1,9 +1,16 @@
 import asyncio
+import json
+import sys
+from pathlib import Path
 
 import pytest
 
 from rlm_train.proxy import ClientHandle, SubLLMProxy
 from rlm_train.worker import Worker
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "environments" / "oolong"))
+
+from oolong.env import _score  # noqa: E402
 
 
 def response_schema() -> dict:
@@ -24,6 +31,28 @@ def response_schema() -> dict:
         "required": ["label", "count"],
         "additionalProperties": False,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_location", ["info", "input"])
+async def test_oolong_score_resolves_metadata_from_state(metadata_location: str) -> None:
+    metadata = {
+        "answer": "['entity']",
+        "answer_type": "ANSWER_TYPE.TEXT",
+    }
+    state = {"rlm_final_answer": "entity"}
+    if metadata_location == "info":
+        state["info"] = json.dumps(metadata)
+    else:
+        state["input"] = {"info": metadata}
+
+    assert await _score(None, state) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_oolong_score_reports_missing_metadata_clearly() -> None:
+    with pytest.raises(ValueError, match="requires dataset metadata"):
+        await _score(None, {"rlm_final_answer": "entity"})
 
 
 @pytest.mark.asyncio

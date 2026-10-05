@@ -76,8 +76,21 @@ def _synth_score(datapoint: dict, output: str) -> float:
 
 async def _score(info, state: vf.State, **_kw: Any) -> float:
     final = state.get("rlm_final_answer") or state.get("final_answer") or ""
-    meta = json.loads(info) if isinstance(info, str) else info
+    meta = _resolve_score_info(info, state)
     return _synth_score(meta, final)
+
+
+def _resolve_score_info(info: Any, state: vf.State) -> dict[str, Any]:
+    raw_info = info if info is not None else state.get("info")
+    if raw_info is None:
+        state_input = state.get("input")
+        if isinstance(state_input, dict):
+            raw_info = state_input.get("info")
+    if isinstance(raw_info, str):
+        raw_info = json.loads(raw_info)
+    if not isinstance(raw_info, dict):
+        raise ValueError("OOLONG scoring requires dataset metadata in 'info'")
+    return raw_info
 
 
 _QUESTION_INSTRUCTION = (
