@@ -97,8 +97,10 @@ class RLMTrainEnv(vf.MultiTurnEnv):
             max_iterations=self._max_iterations,
         )
 
-    async def setup_state(self, state: State) -> None:
-        await super().setup_state(state)
+    async def setup_state(self, state: State) -> State:
+        initialized_state = await super().setup_state(state)
+        if initialized_state is not None:
+            state = initialized_state
 
         info = state.get("info") or {}
         context_payload = info.get("context")
@@ -159,6 +161,7 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         )
         state["rlm_history"].append(user_iter0)
         state["prompt"] = list(state["rlm_history"])
+        return state
 
     async def get_prompt_messages(self, state: State) -> Messages:
         if not state["trajectory"]:

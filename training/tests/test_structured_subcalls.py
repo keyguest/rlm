@@ -4,7 +4,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from datasets import Dataset
 
+from rlm_train.env import RLMTrainEnv
 from rlm_train.proxy import ClientHandle, SubLLMProxy
 from rlm_train.worker import Worker
 
@@ -31,6 +33,41 @@ def response_schema() -> dict:
         "required": ["label", "count"],
         "additionalProperties": False,
     }
+
+
+class FakeBackend:
+    async def start(self, **kwargs) -> None:
+        pass
+
+    async def load_context(self, payload, index=None) -> int:
+        return 0
+
+    async def bootstrap(self, code: str) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_setup_state_returns_state_for_verifiers_011_contract() -> None:
+    backend = FakeBackend()
+    dataset = Dataset.from_list(
+        [{"prompt": [{"role": "user", "content": "question"}], "answer": "answer"}]
+    )
+    env = RLMTrainEnv(dataset=dataset, backend_factory=lambda: backend)
+    state = {
+        "info": {"context": "context", "root_prompt": "question"},
+        "client": object(),
+        "model": "test-model",
+    }
+    try:
+        initialized = await env.setup_state(state)
+        assert initialized is state
+        assert initialized["rlm_context_count"] == 1
+    finally:
+        await env.cleanup_rlm(state)
+        await env.teardown_rlm()
 
 
 @pytest.mark.asyncio
