@@ -224,6 +224,74 @@ def test_rlm_query_batched_dispatches(kernel_mode: str):
 
 
 @BOTH_MODES
+def test_structured_rlm_query_returns_python_value(kernel_mode: str):
+    calls = []
+
+    def structured_subcall(prompt, response_schema, model):
+        calls.append((prompt, response_schema, model))
+        return RLMChatCompletion(
+            root_model="fake-model",
+            prompt=prompt,
+            response='{"label":"entity","count":3}',
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=0.001,
+            parsed_response={"label": "entity", "count": 3},
+        )
+
+    schema = {
+        "title": "Classification",
+        "description": "A label and count.",
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "The exact label."},
+            "count": {"type": "integer", "description": "The exact count."},
+        },
+        "required": ["label", "count"],
+        "additionalProperties": False,
+    }
+    with IPythonREPL(
+        kernel_mode=kernel_mode,
+        structured_subcall_fn=structured_subcall,
+    ) as repl:
+        result = repl.execute_code(
+            f"schema = {schema!r}\n"
+            "value = rlm_query('classify', model='child', response_schema=schema)\n"
+            "print(value['label'], value['count'])"
+        )
+
+    assert result.stderr == ""
+    assert "entity 3" in result.stdout
+    assert calls == [("classify", schema, "child")]
+    assert len(result.rlm_calls) == 1
+
+
+@BOTH_MODES
+def test_structured_rlm_query_failure_is_not_text(kernel_mode: str):
+    def structured_subcall(prompt, response_schema, model):
+        raise ValueError("bad structured child output")
+
+    schema = {
+        "title": "Value",
+        "description": "One exact value.",
+        "type": "object",
+        "properties": {
+            "value": {"type": "string", "description": "The exact value."},
+        },
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+    with IPythonREPL(
+        kernel_mode=kernel_mode,
+        structured_subcall_fn=structured_subcall,
+    ) as repl:
+        result = repl.execute_code(
+            f"schema = {schema!r}\nvalue = rlm_query('classify', response_schema=schema)"
+        )
+
+    assert "bad structured child output" in result.stderr
+
+
+@BOTH_MODES
 def test_rlm_query_falls_back_when_no_subcall_fn(kernel_mode: str):
     """Without subcall_fn, rlm_query falls through to llm_query (which errors
     cleanly when no LM handler is configured)."""

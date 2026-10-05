@@ -1,3 +1,4 @@
+import json
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from rlm.core.types import (
     CodeBlock,
     EnvironmentType,
     REPLResult,
+    ResponseSchema,
     RLMChatCompletion,
     RLMIteration,
     RLMMetadata,
@@ -21,6 +23,7 @@ from rlm.utils.exceptions import (
     BudgetExceededError,
     CancellationError,
     ErrorThresholdExceededError,
+    StructuredOutputError,
     TimeoutExceededError,
     TokenLimitExceededError,
 )
@@ -35,6 +38,12 @@ from rlm.utils.prompts import (
     build_user_prompt,
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
+from rlm.utils.structured_output import (
+    build_structured_output_instruction,
+    parse_and_validate_response,
+    structured_retry_message,
+    validate_response_schema,
+)
 from rlm.utils.token_utils import count_tokens, get_context_limit
 
 
@@ -277,6 +286,8 @@ class RLM:
             # docker invokes it via its host-side proxy (/rlm_query endpoints).
             if self.environment_type in ("local", "ipython", "docker") and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
+            if self.environment_type in ("local", "ipython", "docker"):
+                env_kwargs["structured_subcall_fn"] = self._structured_subcall
             # Pass custom tools to the environment
             if self.custom_tools is not None:
                 env_kwargs["custom_tools"] = self.custom_tools
@@ -301,6 +312,7 @@ class RLM:
         self,
         prompt: str | dict[str, Any],
         root_prompt: str | None = None,
+        response_schema: ResponseSchema | None = None,
     ) -> list[dict[str, Any]]:
         """
         Setup the system prompt for the RLM. Also include metadata about the prompt and build
@@ -316,6 +328,8 @@ class RLM:
         )
         if self.user_prologue:
             message_history.append({"role": "user", "content": self.user_prologue})
+        if response_schema is not None:
+            message_history[0]["content"] += build_structured_output_instruction(response_schema)
         if self.compaction:
             message_history[0]["content"] += (
                 "\n\nThe full conversation history (trajectory segments and any summaries) "
@@ -324,7 +338,11 @@ class RLM:
         return message_history
 
     def completion(
-        self, prompt: str | dict[str, Any], root_prompt: str | None = None
+        self,
+        prompt: str | dict[str, Any],
+        root_prompt: str | None = None,
+        response_schema: ResponseSchema | None = None,
+        structured_retries: int = 1,
     ) -> RLMChatCompletion:
         """
         Recursive Language Model completion call. This is the main entry point for querying an RLM, and
@@ -334,13 +352,18 @@ class RLM:
 
         Args:
             prompt: A single string or dictionary of messages to pass as context to the model.
-            root_prompt: We allow the RLM's root LM to see a (small) prompt that the user specifies. A common example of this
-            is if the user is asking the RLM to answer a question, we can pass the question as the root prompt.
+            root_prompt: A small prompt shown directly to the root LM.
+            response_schema: Optional documented JSON Schema for a structured final response.
+            structured_retries: Number of invalid structured final answers the RLM may correct.
         Returns:
             A final answer as a string.
         """
         time_start = time.perf_counter()
         self._completion_start_time = time_start
+        if structured_retries < 0:
+            raise ValueError("structured_retries must be non-negative")
+        if response_schema is not None:
+            validate_response_schema(response_schema)
 
         # Reset tracking state for this completion
         self._consecutive_errors = 0
@@ -348,15 +371,20 @@ class RLM:
         self._best_partial_answer = None
         # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
         if self.depth >= self.max_depth:
-            return self._fallback_answer(prompt)
+            return self._fallback_completion(prompt, response_schema)
 
         if self.logger:
             self.logger.clear_iterations()
 
         with self._spawn_completion_context(prompt) as (lm_handler, environment):
-            message_history = self._setup_prompt(prompt, root_prompt=root_prompt)
+            message_history = self._setup_prompt(
+                prompt,
+                root_prompt=root_prompt,
+                response_schema=response_schema,
+            )
 
             compaction_count = 0
+            structured_failures = 0
             try:
                 for i in range(self.max_iterations):
                     # Check timeout before each iteration
@@ -420,6 +448,17 @@ class RLM:
                             break
                     iteration.final_answer = final_answer
 
+                    parsed_response = None
+                    structured_error: StructuredOutputError | None = None
+                    if final_answer is not None and response_schema is not None:
+                        try:
+                            parsed_response = parse_and_validate_response(
+                                final_answer, response_schema
+                            )
+                        except StructuredOutputError as e:
+                            structured_error = e
+                            iteration.final_answer = None
+
                     # Store as best partial answer (most recent response with content)
                     if iteration.response and iteration.response.strip():
                         self._best_partial_answer = iteration.response
@@ -430,6 +469,19 @@ class RLM:
 
                     # Verbose output for this iteration
                     self.verbose.print_iteration(iteration, i + 1)
+
+                    if structured_error is not None:
+                        structured_failures += 1
+                        if structured_failures > structured_retries:
+                            raise structured_error
+                        new_messages = format_iteration(iteration)
+                        message_history.extend(new_messages)
+                        message_history.append(structured_retry_message(structured_error))
+                        if self.compaction and hasattr(environment, "append_compaction_entry"):
+                            environment.append_compaction_entry(
+                                [*new_messages, structured_retry_message(structured_error)]
+                            )
+                        continue
 
                     if final_answer is not None:
                         time_end = time.perf_counter()
@@ -450,6 +502,7 @@ class RLM:
                             usage_summary=usage,
                             execution_time=time_end - time_start,
                             metadata=self.logger.get_trajectory() if self.logger else None,
+                            parsed_response=parsed_response,
                         )
 
                     # Format the iteration for the next prompt.
@@ -470,6 +523,11 @@ class RLM:
             # Default behavior: we run out of iterations, provide one final answer
             time_end = time.perf_counter()
             final_answer = self._default_answer(message_history, lm_handler)
+            parsed_response = (
+                parse_and_validate_response(final_answer, response_schema)
+                if response_schema is not None
+                else None
+            )
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
@@ -487,6 +545,7 @@ class RLM:
                 usage_summary=usage,
                 execution_time=time_end - time_start,
                 metadata=self.logger.get_trajectory() if self.logger else None,
+                parsed_response=parsed_response,
             )
 
     def _check_timeout(self, iteration: int, time_start: float) -> None:
@@ -695,15 +754,53 @@ class RLM:
 
         return response
 
-    def _fallback_answer(self, message: str | dict[str, Any]) -> str:
+    def _fallback_completion(
+        self,
+        message: str | dict[str, Any],
+        response_schema: ResponseSchema | None = None,
+    ) -> RLMChatCompletion:
         """
         Fallback behavior if the RLM is actually at max depth, and should be treated as an LM.
         """
         client: BaseLM = get_client(self.backend, self.backend_kwargs)
-        response = client.completion(message)
-        return response
+        prompt = message
+        if response_schema is not None:
+            instruction = build_structured_output_instruction(response_schema)
+            if isinstance(message, str):
+                prompt = [
+                    {"role": "system", "content": instruction.strip()},
+                    {"role": "user", "content": message},
+                ]
+            else:
+                prompt = [
+                    {"role": "system", "content": instruction.strip()},
+                    {
+                        "role": "user",
+                        "content": json.dumps(message, ensure_ascii=False),
+                    },
+                ]
+        start_time = time.perf_counter()
+        response = client.completion(prompt)
+        usage = client.get_usage_summary()
+        return RLMChatCompletion(
+            root_model=client.model_name,
+            prompt=message,
+            response=response,
+            usage_summary=usage,
+            execution_time=time.perf_counter() - start_time,
+            parsed_response=(
+                parse_and_validate_response(response, response_schema)
+                if response_schema is not None
+                else None
+            ),
+        )
 
-    def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
+    def _subcall(
+        self,
+        prompt: str,
+        model: str | None = None,
+        response_schema: ResponseSchema | None = None,
+    ) -> RLMChatCompletion:
         """
         Handle a subcall from the environment, potentially spawning a child RLM.
 
@@ -740,7 +837,16 @@ class RLM:
             root_model = model or client.model_name
             start_time = time.perf_counter()
             try:
-                response = client.completion(prompt)
+                completion_prompt: str | list[dict[str, str]] = prompt
+                if response_schema is not None:
+                    completion_prompt = [
+                        {
+                            "role": "system",
+                            "content": build_structured_output_instruction(response_schema).strip(),
+                        },
+                        {"role": "user", "content": prompt},
+                    ]
+                response = client.completion(completion_prompt)
                 end_time = time.perf_counter()
                 model_usage = client.get_last_usage()
                 usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
@@ -750,8 +856,15 @@ class RLM:
                     response=response,
                     usage_summary=usage_summary,
                     execution_time=end_time - start_time,
+                    parsed_response=(
+                        parse_and_validate_response(response, response_schema)
+                        if response_schema is not None
+                        else None
+                    ),
                 )
             except Exception as e:
+                if response_schema is not None:
+                    raise
                 end_time = time.perf_counter()
                 return RLMChatCompletion(
                     root_model=root_model,
@@ -766,6 +879,12 @@ class RLM:
         if self.max_budget is not None:
             remaining_budget = self.max_budget - self._cumulative_cost
             if remaining_budget <= 0:
+                if response_schema is not None:
+                    raise BudgetExceededError(
+                        spent=self._cumulative_cost,
+                        budget=self.max_budget,
+                        message="Budget exhausted before structured child RLM call",
+                    )
                 return RLMChatCompletion(
                     root_model=resolved_model,
                     prompt=prompt,
@@ -783,6 +902,13 @@ class RLM:
             elapsed = time.perf_counter() - self._completion_start_time
             remaining_timeout = self.max_timeout - elapsed
             if remaining_timeout <= 0:
+                if response_schema is not None:
+                    raise TimeoutExceededError(
+                        elapsed=elapsed,
+                        timeout=self.max_timeout,
+                        partial_answer=self._best_partial_answer,
+                        message="Timeout exhausted before structured child RLM call",
+                    )
                 return RLMChatCompletion(
                     root_model=resolved_model,
                     prompt=prompt,
@@ -833,7 +959,11 @@ class RLM:
             on_subcall_complete=self.on_subcall_complete,
         )
         try:
-            result = child.completion(prompt, root_prompt=None)
+            result = child.completion(
+                prompt,
+                root_prompt=None,
+                response_schema=response_schema,
+            )
             # Track child's cost in parent's cumulative cost
             if result.usage_summary and result.usage_summary.total_cost:
                 self._cumulative_cost += result.usage_summary.total_cost
@@ -842,6 +972,8 @@ class RLM:
             # Propagate child's spending to parent
             self._cumulative_cost += e.spent
             error_msg = f"Budget exceeded - {e}"
+            if response_schema is not None:
+                raise
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
@@ -851,6 +983,8 @@ class RLM:
             )
         except Exception as e:
             error_msg = str(e)
+            if response_schema is not None:
+                raise
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
@@ -868,6 +1002,16 @@ class RLM:
                     self.on_subcall_complete(next_depth, str(resolved_model), duration, error_msg)
                 except Exception:
                     pass  # Don't let callback errors break execution
+
+    def _structured_subcall(
+        self,
+        prompt: str,
+        response_schema: ResponseSchema,
+        model: str | None = None,
+    ) -> RLMChatCompletion:
+        """Run a recursive subcall with a validated structured response contract."""
+        validate_response_schema(response_schema)
+        return self._subcall(prompt, model, response_schema=response_schema)
 
     def _validate_persistent_environment_support(self) -> None:
         """

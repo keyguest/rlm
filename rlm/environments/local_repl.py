@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
-from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.core.types import JSONValue, REPLResult, ResponseSchema, RLMChatCompletion
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
     NonIsolatedEnv,
@@ -158,6 +158,9 @@ class LocalREPL(NonIsolatedEnv):
         persistent: bool = False,
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        structured_subcall_fn: (
+            Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None
+        ) = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
@@ -173,6 +176,7 @@ class LocalREPL(NonIsolatedEnv):
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
+        self.structured_subcall_fn = structured_subcall_fn
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
@@ -310,7 +314,12 @@ class LocalREPL(NonIsolatedEnv):
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
 
-    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+    def _rlm_query(
+        self,
+        prompt: str,
+        model: str | None = None,
+        response_schema: ResponseSchema | None = None,
+    ) -> str | JSONValue:
         """Spawn a recursive RLM sub-call for deeper thinking on a subtask.
 
         When a subcall callback is available (max_depth > 1), this spawns a child
@@ -321,6 +330,13 @@ class LocalREPL(NonIsolatedEnv):
             prompt: The prompt to send to the child RLM.
             model: Optional model name override for the child.
         """
+        if response_schema is not None:
+            if self.structured_subcall_fn is None:
+                raise RuntimeError("No structured RLM subcall callback configured")
+            completion = self.structured_subcall_fn(prompt, response_schema, model)
+            self._pending_llm_calls.append(completion)
+            return completion.parsed_response
+
         if self.subcall_fn is not None:
             try:
                 completion = self.subcall_fn(prompt, model)
@@ -332,7 +348,12 @@ class LocalREPL(NonIsolatedEnv):
         # Fall back to plain LM call if no recursive capability
         return self._llm_query(prompt, model)
 
-    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        response_schema: ResponseSchema | None = None,
+    ) -> list[str | JSONValue]:
         """Spawn recursive RLM sub-calls for multiple prompts in parallel.
 
         Each prompt gets its own child RLM for deeper thinking. When multiple
@@ -349,6 +370,11 @@ class LocalREPL(NonIsolatedEnv):
         Returns:
             List of responses in the same order as input prompts.
         """
+        if response_schema is not None:
+            if self.structured_subcall_fn is None:
+                raise RuntimeError("No structured RLM subcall callback configured")
+            return self._rlm_query_structured_batched(prompts, response_schema, model)
+
         if self.subcall_fn is not None:
             # For 0 or 1 prompts, no need for thread pool overhead
             if len(prompts) <= 1:
@@ -395,6 +421,38 @@ class LocalREPL(NonIsolatedEnv):
 
         # Fall back to plain batched LM call if no recursive capability
         return self._llm_query_batched(prompts, model)
+
+    def _rlm_query_structured_batched(
+        self,
+        prompts: list[str],
+        response_schema: ResponseSchema,
+        model: str | None,
+    ) -> list[JSONValue]:
+        if not prompts:
+            return []
+
+        results: list[JSONValue] = [None] * len(prompts)
+        completions: list[tuple[int, RLMChatCompletion]] = []
+        lock = threading.Lock()
+
+        def run_subcall(index: int, prompt: str) -> None:
+            assert self.structured_subcall_fn is not None
+            completion = self.structured_subcall_fn(prompt, response_schema, model)
+            with lock:
+                completions.append((index, completion))
+            results[index] = completion.parsed_response
+
+        max_workers = min(self.max_concurrent_subcalls, len(prompts))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(run_subcall, index, prompt) for index, prompt in enumerate(prompts)
+            ]
+            for future in as_completed(futures):
+                future.result()
+
+        completions.sort(key=lambda item: item[0])
+        self._pending_llm_calls.extend(completion for _, completion in completions)
+        return results
 
     def load_context(self, context_payload: dict | list | str):
         """Load context into the environment as context_0 (and 'context' alias)."""

@@ -33,6 +33,9 @@ target-version = "py311"
 select = ["E", "W", "F", "I", "B", "UP"]
 ignore = ["E501"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["rlm", "rlm_train"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

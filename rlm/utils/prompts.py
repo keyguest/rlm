@@ -13,8 +13,8 @@ The REPL environment is initialized with:
 1. A `context` variable that contains extremely important information about your query. You should check the content of the `context` variable to understand what you are working with. Make sure you look through it sufficiently as you answer your query.
 2. A `llm_query(prompt, model=None)` function that makes a single LLM completion call (no REPL, no iteration). Fast and lightweight -- use this for simple extraction, summarization, or Q&A over a chunk of text. The sub-LLM can handle around 500K chars.
 3. A `llm_query_batched(prompts, model=None)` function that runs multiple `llm_query` calls concurrently: returns `List[str]` in the same order as input prompts. Much faster than sequential `llm_query` calls for independent queries.
-4. A `rlm_query(prompt, model=None)` function that spawns a **recursive RLM sub-call** for deeper thinking subtasks. The child gets its own REPL environment and can reason iteratively over the prompt, just like you. Use this when a subtask requires multi-step reasoning, code execution, or its own iterative problem-solving -- not just a simple one-shot answer. Falls back to `llm_query` if recursion is not available.
-5. A `rlm_query_batched(prompts, model=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
+4. A `rlm_query(prompt, model=None, response_schema=None)` function that spawns a **recursive RLM sub-call** for deeper thinking subtasks. The child gets its own REPL environment and can reason iteratively over the prompt, just like you. Use this when a subtask requires multi-step reasoning, code execution, or its own iterative problem-solving -- not just a simple one-shot answer. Falls back to `llm_query` if recursion is not available. When exact machine-readable data is needed, pass a documented JSON Schema as `response_schema`; every property must have a `description`, all object fields must be listed in `required`, and objects must set `additionalProperties` to `False`. The return value is then a validated Python value rather than text.
+5. A `rlm_query_batched(prompts, model=None, response_schema=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. A supplied response schema applies to every result. Falls back to `llm_query_batched` if recursion is not available.
 6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. Use this to check what variables exist.
 7. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
 8. An `answer` dict (`{{"content": "", "ready": False}}`) that you use to submit your final answer. See "Submitting your final answer" below.
@@ -130,10 +130,28 @@ To use the REPL, you need to write code in ```repl``` blocks; the REPL persists 
 - `context`: the important, potentially very long information related to the prompt (typically `str` or `list[str]`).
 - `llm_query(prompt: str, model: str | None = None) -> str`: a single sub-LLM completion. Use for extraction, summarization, or Q&A over a chunk of text. Sub-LLM context window ≈ 500K chars.
 - `llm_query_batched(prompts: list[str], model=None) -> list[str]`: concurrently call several LLM calls in parallel over a list of prompts; same order out as in.
-- `rlm_query(prompt, model=None)` / `rlm_query_batched(prompts, model=None)`: recursive RLM sub-calls. Fall back to `llm_query` / `llm_query_batched` when recursion is disabled.
+- `rlm_query(prompt, model=None, response_schema=None)` / `rlm_query_batched(prompts, model=None, response_schema=None)`: recursive RLM sub-calls. Pass a documented JSON Schema to receive validated Python data instead of untrusted text. Fall back to `llm_query` / `llm_query_batched` when recursion is disabled.
 - `SHOW_VARS() -> str`: list every variable currently in the REPL.
 - `answer`: dict initialized to `{{"content": "", "ready": False}}`. To submit, set `answer["content"]` to the final answer and `answer["ready"] = True` inside a ```repl``` block.
 {custom_tools_section}
+
+For reliable programmatic decisions, define the response model in the REPL and pass it to the child. Descriptions tell the child exactly what each field means:
+```repl
+schema = {{
+    "title": "Category count",
+    "description": "The category selected by the child and its exact count.",
+    "type": "object",
+    "properties": {{
+        "category": {{"type": "string", "description": "The exact category label."}},
+        "count": {{"type": "integer", "description": "The exact number of matches."}},
+    }},
+    "required": ["category", "count"],
+    "additionalProperties": False,
+}}
+result = rlm_query("Classify and count the records", response_schema=schema)
+if result["count"] > 0:
+    print(result["category"], result["count"])
+```
 
 REPL outputs over ~20K characters are truncated, so for longer payloads slice `context` and pass slices through `llm_query` rather than `print`-ing them whole. The REPL is NOT a Jupyter cell — only `print(...)` output (stdout) is shown back to you between turns; a bare expression on the last line is silently discarded. Always wrap inspections in `print(...)`.
 
@@ -172,9 +190,11 @@ ORCHESTRATOR_ADDENDUM = "\n\n".join(
             "the small results back in the REPL."
         ),
         (
-            "Sub-LLMs have no REPL; they only see the prompt and the `context` slice you pass "
-            "them. Hand them clean, focused inputs and ask for terse, structured outputs you "
-            "can manipulate programmatically."
+            "Plain sub-LMs called with `llm_query` have no REPL; they only see the prompt and "
+            "the `context` slice you pass them. Child RLMs called with `rlm_query` have their "
+            "own REPL. Hand either one clean, focused inputs. When parent code must branch on "
+            "a child RLM result, pass a documented `response_schema` and use the returned "
+            "validated Python value instead of extracting keywords from text."
         ),
         (
             "Sub-call budget is finite on two independent axes, and `llm_query_batched` only "

@@ -45,7 +45,7 @@ from rlm.core.comms_utils import (
     socket_recv,
     socket_send,
 )
-from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.core.types import JSONValue, REPLResult, ResponseSchema, RLMChatCompletion
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
     NonIsolatedEnv,
@@ -118,11 +118,15 @@ class _SubcallBroker:
     def __init__(
         self,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None,
+        structured_subcall_fn: (
+            Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None
+        ) = None,
         max_concurrent: int = 4,
         host: str = "127.0.0.1",
         port: int = 0,
     ):
         self.subcall_fn = subcall_fn
+        self.structured_subcall_fn = structured_subcall_fn
         self.max_concurrent = max_concurrent
         self.host = host
         self._port = port
@@ -182,6 +186,13 @@ class _SubcallBroker:
         with self._subcall_semaphore:
             return self.subcall_fn(prompt, model)
 
+    def _run_structured_subcall(
+        self, prompt: str, response_schema: ResponseSchema, model: str | None
+    ) -> RLMChatCompletion:
+        assert self.structured_subcall_fn is not None
+        with self._subcall_semaphore:
+            return self.structured_subcall_fn(prompt, response_schema, model)
+
     def _dispatch(self, data: dict[str, Any]) -> dict[str, Any]:
         req_type = data.get("type")
 
@@ -201,6 +212,20 @@ class _SubcallBroker:
             return {"ok": True}
 
         if req_type == "subcall":
+            response_schema = data.get("response_schema")
+            if response_schema is not None:
+                if self.structured_subcall_fn is None:
+                    return {"error": "No structured RLM subcall callback configured"}
+                try:
+                    completion = self._run_structured_subcall(
+                        data.get("prompt", ""), response_schema, data.get("model")
+                    )
+                    with self._lock:
+                        self._completions_by_cell.setdefault(cell_id, []).append(completion)
+                    return {"completion": completion.to_dict()}
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+
             if self.subcall_fn is None:
                 return {"error": "No subcall_fn configured; rlm_query unavailable"}
             try:
@@ -212,6 +237,10 @@ class _SubcallBroker:
                 return {"error": f"{type(e).__name__}: {e}"}
 
         if req_type == "subcall_batched":
+            response_schema = data.get("response_schema")
+            if response_schema is not None:
+                return self._dispatch_structured_batch(data, cell_id, response_schema)
+
             if self.subcall_fn is None:
                 return {"error": "No subcall_fn configured; rlm_query_batched unavailable"}
             prompts = data.get("prompts") or []
@@ -253,6 +282,45 @@ class _SubcallBroker:
             }
 
         return {"error": f"Unknown message type: {req_type!r}"}
+
+    def _dispatch_structured_batch(
+        self,
+        data: dict[str, Any],
+        cell_id: str,
+        response_schema: ResponseSchema,
+    ) -> dict[str, Any]:
+        if self.structured_subcall_fn is None:
+            return {"error": "No structured RLM subcall callback configured"}
+
+        prompts = data.get("prompts") or []
+        model = data.get("model")
+        responses: list[JSONValue] = [None] * len(prompts)
+        completions: list[tuple[int, RLMChatCompletion]] = []
+        lock = threading.Lock()
+
+        def run(index: int, prompt: str) -> None:
+            completion = self._run_structured_subcall(prompt, response_schema, model)
+            with lock:
+                completions.append((index, completion))
+            responses[index] = completion.parsed_response
+
+        max_workers = max(1, min(self.max_concurrent, len(prompts) or 1))
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(run, index, prompt) for index, prompt in enumerate(prompts)
+                ]
+                for future in as_completed(futures):
+                    future.result()
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+        completions.sort(key=lambda item: item[0])
+        with self._lock:
+            self._completions_by_cell.setdefault(cell_id, []).extend(
+                completion for _, completion in completions
+            )
+        return {"parsed_responses": responses}
 
     def stop(self) -> None:
         # Flip the flag *before* tearing down the server so any handler
@@ -383,37 +451,55 @@ def _build_kernel_bootstrap(
             ccs = resp.get("chat_completions") or []
             return [c.get("response", "") for c in ccs]
 
-        def rlm_query(prompt, model=None):
+        def rlm_query(prompt, model=None, response_schema=None):
             if _RLM_SUBCALL_ADDRESS is None:
+                if response_schema is not None:
+                    raise RuntimeError("No structured RLM subcall broker configured")
                 return llm_query(prompt, model=model)
             resp = _rlm_request(_RLM_SUBCALL_ADDRESS, {{
                 "type": "subcall", "prompt": prompt, "model": model,
+                "response_schema": response_schema,
                 "cell_id": _RLM_CURRENT_CELL,
             }})
             if not isinstance(resp, dict):
+                if response_schema is not None:
+                    raise RuntimeError("RLM query failed: malformed response")
                 return "Error: RLM query failed - malformed response"
             if resp.get("error"):
+                if response_schema is not None:
+                    raise RuntimeError(resp["error"])
                 # Fall back to a plain LM call if the parent has no subcall_fn
                 if "No subcall_fn" in resp["error"]:
                     return llm_query(prompt, model=model)
                 return f"Error: {{resp['error']}}"
             cc = resp.get("completion") or {{}}
+            if response_schema is not None:
+                return cc.get("parsed_response")
             return cc.get("response", "")
 
-        def rlm_query_batched(prompts, model=None):
+        def rlm_query_batched(prompts, model=None, response_schema=None):
             prompts = list(prompts)
             if _RLM_SUBCALL_ADDRESS is None:
+                if response_schema is not None:
+                    raise RuntimeError("No structured RLM subcall broker configured")
                 return llm_query_batched(prompts, model=model)
             resp = _rlm_request(_RLM_SUBCALL_ADDRESS, {{
                 "type": "subcall_batched", "prompts": prompts, "model": model,
+                "response_schema": response_schema,
                 "cell_id": _RLM_CURRENT_CELL,
             }})
             if not isinstance(resp, dict):
+                if response_schema is not None:
+                    raise RuntimeError("RLM query failed: malformed response")
                 return ["Error: RLM query failed - malformed response"] * len(prompts)
             if resp.get("error"):
+                if response_schema is not None:
+                    raise RuntimeError(resp["error"])
                 if "No subcall_fn" in resp["error"]:
                     return llm_query_batched(prompts, model=model)
                 return [f"Error: {{resp['error']}}"] * len(prompts)
+            if response_schema is not None:
+                return list(resp.get("parsed_responses") or [])
             return list(resp.get("responses") or [])
 
         class _RLMAnswerDict(dict):
@@ -525,6 +611,9 @@ class IPythonREPL(NonIsolatedEnv):
         persistent: bool = False,
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        structured_subcall_fn: (
+            Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None
+        ) = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         kernel_mode: KernelMode = "in_process",
@@ -559,6 +648,7 @@ class IPythonREPL(NonIsolatedEnv):
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
+        self.structured_subcall_fn = structured_subcall_fn
         self.kernel_mode: KernelMode = kernel_mode
         # Normalize cell_timeout: 0 or negative is meaningless (subprocess
         # mode would interpret it as "give up immediately"). Treat as
@@ -728,8 +818,12 @@ class IPythonREPL(NonIsolatedEnv):
         broker_subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = (
             self._tracked_subcall if self.subcall_fn is not None else None
         )
+        broker_structured_subcall_fn: (
+            Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None
+        ) = self._tracked_structured_subcall if self.structured_subcall_fn is not None else None
         self._broker = _SubcallBroker(
             subcall_fn=broker_subcall_fn,
+            structured_subcall_fn=broker_structured_subcall_fn,
             max_concurrent=self.max_concurrent_subcalls,
         )
         self._broker.start()
@@ -908,6 +1002,22 @@ class IPythonREPL(NonIsolatedEnv):
             with self._subcall_threads_lock:
                 self._subcall_threads.discard(cur)
 
+    def _tracked_structured_subcall(
+        self,
+        prompt: str,
+        response_schema: ResponseSchema,
+        model: str | None,
+    ) -> RLMChatCompletion:
+        assert self.structured_subcall_fn is not None
+        cur = threading.get_ident()
+        with self._subcall_threads_lock:
+            self._subcall_threads.add(cur)
+        try:
+            return self.structured_subcall_fn(prompt, response_schema, model)
+        finally:
+            with self._subcall_threads_lock:
+                self._subcall_threads.discard(cur)
+
     def _run_inprocess_subcall(self, prompt: str, model: str | None) -> RLMChatCompletion:
         """Invoke ``subcall_fn`` under the per-instance semaphore.
 
@@ -919,7 +1029,28 @@ class IPythonREPL(NonIsolatedEnv):
         with self._inprocess_subcall_semaphore:
             return self._tracked_subcall(prompt, model)
 
-    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+    def _run_inprocess_structured_subcall(
+        self,
+        prompt: str,
+        response_schema: ResponseSchema,
+        model: str | None,
+    ) -> RLMChatCompletion:
+        with self._inprocess_subcall_semaphore:
+            return self._tracked_structured_subcall(prompt, response_schema, model)
+
+    def _rlm_query(
+        self,
+        prompt: str,
+        model: str | None = None,
+        response_schema: ResponseSchema | None = None,
+    ) -> JSONValue:
+        if response_schema is not None:
+            if self.structured_subcall_fn is None:
+                raise RuntimeError("No structured RLM subcall callback configured")
+            completion = self._run_inprocess_structured_subcall(prompt, response_schema, model)
+            self._pending_llm_calls.append(completion)
+            return completion.parsed_response
+
         if self.subcall_fn is None:
             return self._llm_query(prompt, model)
         try:
@@ -929,7 +1060,15 @@ class IPythonREPL(NonIsolatedEnv):
         except Exception as e:
             return f"Error: RLM query failed - {e}"
 
-    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        response_schema: ResponseSchema | None = None,
+    ) -> list[JSONValue]:
+        if response_schema is not None:
+            return self._rlm_query_structured_batched(prompts, response_schema, model)
+
         if self.subcall_fn is None:
             return self._llm_query_batched(prompts, model)
 
@@ -969,6 +1108,37 @@ class IPythonREPL(NonIsolatedEnv):
         completions.sort(key=lambda x: x[0])
         for _, completion in completions:
             self._pending_llm_calls.append(completion)
+        return results
+
+    def _rlm_query_structured_batched(
+        self,
+        prompts: list[str],
+        response_schema: ResponseSchema,
+        model: str | None,
+    ) -> list[JSONValue]:
+        if self.structured_subcall_fn is None:
+            raise RuntimeError("No structured RLM subcall callback configured")
+        if not prompts:
+            return []
+
+        results: list[JSONValue] = [None] * len(prompts)
+        completions: list[tuple[int, RLMChatCompletion]] = []
+        lock = threading.Lock()
+
+        def run(index: int, prompt: str) -> None:
+            completion = self._run_inprocess_structured_subcall(prompt, response_schema, model)
+            with lock:
+                completions.append((index, completion))
+            results[index] = completion.parsed_response
+
+        max_workers = min(self.max_concurrent_subcalls, len(prompts))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run, index, prompt) for index, prompt in enumerate(prompts)]
+            for future in as_completed(futures):
+                future.result()
+
+        completions.sort(key=lambda item: item[0])
+        self._pending_llm_calls.extend(completion for _, completion in completions)
         return results
 
     # -------------------------------------------------------------------------

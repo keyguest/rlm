@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
-from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.core.types import JSONValue, REPLResult, ResponseSchema, RLMChatCompletion
 from rlm.environments.base_env import (
     NonIsolatedEnv,
     extract_tool_value,
@@ -56,6 +56,9 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
     # Callback for recursive RLM sub-calls. ``None`` means recursion is not
     # configured, so rlm_query falls back to a plain llm_query.
     subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None
+    structured_subcall_fn: Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None = (
+        None
+    )
     max_concurrent_subcalls: int = 4
 
     def log_message(self, *args):
@@ -155,6 +158,20 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
     # Recursive RLM sub-calls (spawns child RLMs on the host)
     # ------------------------------------------------------------------ #
     def _handle_rlm_single(self, body: dict) -> dict:
+        response_schema = body.get("response_schema")
+        if response_schema is not None:
+            if self.structured_subcall_fn is None:
+                return {"error": "No structured RLM subcall callback configured"}
+            try:
+                completion = self.structured_subcall_fn(
+                    body.get("prompt"), response_schema, body.get("model")
+                )
+            except Exception as e:
+                return {"error": f"Structured RLM query failed - {e}"}
+            with self.lock:
+                self.pending_calls.append(completion)
+            return {"parsed_response": completion.parsed_response}
+
         # No recursive capability configured -> behave like a plain llm_query.
         if self.subcall_fn is None:
             return self._handle_single(body)
@@ -173,6 +190,10 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
         return result
 
     def _handle_rlm_batched(self, body: dict) -> dict:
+        response_schema = body.get("response_schema")
+        if response_schema is not None:
+            return self._handle_structured_rlm_batched(body, response_schema)
+
         if self.subcall_fn is None:
             return self._handle_batched(body)
 
@@ -212,6 +233,34 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                 self.pending_calls.append(completion)
 
         return {"responses": results}
+
+    def _handle_structured_rlm_batched(self, body: dict, response_schema: ResponseSchema) -> dict:
+        if self.structured_subcall_fn is None:
+            return {"error": "No structured RLM subcall callback configured"}
+
+        prompts = body.get("prompts", [])
+        model = body.get("model")
+        results: list[JSONValue] = [None] * len(prompts)
+        completions: list[tuple[int, RLMChatCompletion]] = []
+        comp_lock = threading.Lock()
+
+        def run(index: int, prompt: str) -> None:
+            assert self.structured_subcall_fn is not None
+            completion = self.structured_subcall_fn(prompt, response_schema, model)
+            with comp_lock:
+                completions.append((index, completion))
+            results[index] = completion.parsed_response
+
+        max_workers = max(1, min(self.max_concurrent_subcalls, len(prompts) or 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run, index, prompt) for index, prompt in enumerate(prompts)]
+            for future in as_completed(futures):
+                future.result()
+
+        completions.sort(key=lambda item: item[0])
+        with self.lock:
+            self.pending_calls.extend(completion for _, completion in completions)
+        return {"parsed_responses": results}
 
 
 def _build_custom_tools_code(custom_tools: dict[str, Any] | None) -> str:
@@ -307,18 +356,30 @@ def llm_query_batched(prompts, model=None):
     except Exception as e:
         return [f"Error: {{e}}"] * len(prompts)
 
-def rlm_query(prompt, model=None):
+def rlm_query(prompt, model=None, response_schema=None):
     try:
-        d = _post("/rlm_query", {{"prompt": prompt, "model": model, "depth": DEPTH}}, _RLM_TIMEOUT)
+        d = _post("/rlm_query", {{"prompt": prompt, "model": model, "response_schema": response_schema, "depth": DEPTH}}, _RLM_TIMEOUT)
+        if response_schema is not None:
+            if d.get("error"):
+                raise RuntimeError(d["error"])
+            return d["parsed_response"]
         return d.get("response") or f"Error: {{d.get('error')}}"
     except Exception as e:
+        if response_schema is not None:
+            raise
         return f"Error: {{e}}"
 
-def rlm_query_batched(prompts, model=None):
+def rlm_query_batched(prompts, model=None, response_schema=None):
     try:
-        d = _post("/rlm_query_batched", {{"prompts": prompts, "model": model, "depth": DEPTH}}, _RLM_TIMEOUT)
+        d = _post("/rlm_query_batched", {{"prompts": prompts, "model": model, "response_schema": response_schema, "depth": DEPTH}}, _RLM_TIMEOUT)
+        if response_schema is not None:
+            if d.get("error"):
+                raise RuntimeError(d["error"])
+            return d["parsed_responses"]
         return d.get("responses") or [f"Error: {{d.get('error')}}"] * len(prompts)
     except Exception as e:
+        if response_schema is not None:
+            raise
         return [f"Error: {{e}}"] * len(prompts)
 
 def load_state():
@@ -431,6 +492,9 @@ class DockerREPL(NonIsolatedEnv):
         persistent: bool = False,
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        structured_subcall_fn: (
+            Callable[[str, ResponseSchema, str | None], RLMChatCompletion] | None
+        ) = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
@@ -447,6 +511,7 @@ class DockerREPL(NonIsolatedEnv):
         self.image = image
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
+        self.structured_subcall_fn = structured_subcall_fn
         self.compaction = compaction
         self.container_id: str | None = None
         self.proxy_server: ThreadingHTTPServer | None = None
@@ -502,6 +567,9 @@ class DockerREPL(NonIsolatedEnv):
                 "lock": self._calls_lock,
                 "depth": self.depth,
                 "subcall_fn": staticmethod(self.subcall_fn) if self.subcall_fn else None,
+                "structured_subcall_fn": (
+                    staticmethod(self.structured_subcall_fn) if self.structured_subcall_fn else None
+                ),
                 "max_concurrent_subcalls": self.max_concurrent_subcalls,
             },
         )

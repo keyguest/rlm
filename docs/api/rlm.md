@@ -434,6 +434,8 @@ def completion(
     self,
     prompt: str | dict[str, Any],
     root_prompt: str | None = None,
+    response_schema: dict[str, Any] | None = None,
+    structured_retries: int = 1,
 ) -> RLMChatCompletion
 ```
 
@@ -471,6 +473,11 @@ result = rlm.completion(
 )
 ```
 
+**`response_schema` and `structured_retries`**
+{: .no_toc }
+
+Pass a documented JSON Schema to require an exact JSON final answer. Every property must have a non-empty `description`; object schemas must require every declared property and set `additionalProperties` to `False`. The parsed and validated Python value is returned in `result.parsed_response`. Invalid output is sent back to the RLM for correction up to `structured_retries` times, then raises a structured-output error.
+
 #### Returns
 
 `RLMChatCompletion` dataclass:
@@ -484,6 +491,7 @@ class RLMChatCompletion:
     usage_summary: UsageSummary  # Token usage
     execution_time: float        # Total seconds
     metadata: dict | None        # Full trajectory when logger is provided
+    parsed_response: JSONValue | None  # Validated structured result
 ```
 
 #### Example
@@ -551,8 +559,8 @@ The following functions are available to model-generated code inside the REPL:
 |:---------|:------------|
 | `llm_query(prompt, model=None)` | Single plain LM completion. Fast, no REPL or iteration. |
 | `llm_query_batched(prompts, model=None)` | Multiple plain LM completions concurrently. A single failed call doesn't fail the batch — that slot returns `"Error: llm() call failed - <msg>"`, the rest return normally. |
-| `rlm_query(prompt, model=None)` | Spawn a child RLM with its own REPL for deeper thinking. Falls back to `llm_query` at max depth. |
-| `rlm_query_batched(prompts, model=None)` | Spawn multiple child RLMs. Falls back to `llm_query_batched` at max depth. |
+| `rlm_query(prompt, model=None, response_schema=None)` | Spawn a child RLM with its own REPL. With a documented JSON Schema, returns a host-validated Python value and fails loudly on invalid output. |
+| `rlm_query_batched(prompts, model=None, response_schema=None)` | Spawn multiple child RLMs. A supplied schema is validated independently for every result while preserving input order. |
 | `answer` | A dict (`{"content": "", "ready": False}`). Set `answer["content"]` to your final answer and `answer["ready"] = True` to terminate the run. |
 | `SHOW_VARS()` | List all user-created variables in the REPL. |
 | `print(...)` | Print output visible to the model in the next iteration. |

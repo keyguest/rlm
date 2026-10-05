@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "anthropic>=0.75.0",
     "google-genai>=1.56.0",
+    "jsonschema>=4.23.0",
     "openai>=2.14.0",
     "portkey-ai>=2.1.0",
     "pytest>=9.0.2",
@@ -76,6 +77,9 @@ select = [
 ignore = [
     "E501",  # line too long (handled by formatter)
 ]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rlm", "rlm_train"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -104,6 +104,28 @@ We also support a Docker-based environment called `DockerREPL` that launches the
 
 `DockerREPL` supports the full feature set of the local environment: single LM calls (`llm_query` / `llm_query_batched`), recursive sub-RLM calls (`rlm_query` / `rlm_query_batched`, including parallel batched sub-calls bounded by `max_concurrent_subcalls`), `custom_tools` / `custom_sub_tools`, `persistent=True` multi-turn sessions (versioned `context_N` / `history_N` reused across `completion()` calls), and `compaction=True` auto-summarization of the running `history`. For isolated environments, custom tools should be passed as Python code strings or JSON-serializable values (host callables cannot cross the process boundary).
 
+### Structured child RLM results
+
+In `local`, `ipython`, and `docker` environments, model-generated REPL code can pass a documented JSON Schema to `rlm_query`. The child receives the field descriptions as part of its output contract; the host parses and validates its final JSON before returning a Python value to the parent:
+
+```python
+schema = {
+    "title": "Classification result",
+    "description": "The selected label and the exact number of matching records.",
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "description": "The exact category label."},
+        "count": {"type": "integer", "description": "The number of matching records."},
+    },
+    "required": ["label", "count"],
+    "additionalProperties": False,
+}
+result = rlm_query("Classify and count these records", response_schema=schema)
+print(result["label"], result["count"])
+```
+
+`rlm_query_batched(..., response_schema=schema)` applies the same contract to each child. Invalid schemas and invalid child output raise explicit errors rather than returning an error-shaped text response. `RLM.completion(..., response_schema=schema)` provides the same contract for a top-level call, with the parsed value available as `result.parsed_response`.
+
 ### Isolated Environments
 We support several different REPL environments that run on separate, cloud-based machines. Whenever a recursive sub-call is made in these instances, it is requested from the host process.
 

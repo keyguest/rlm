@@ -13,6 +13,9 @@ ClientBackend = Literal[
     "gemini",
 ]
 EnvironmentType = Literal["local", "ipython", "docker", "modal", "prime", "daytona", "e2b"]
+JSONPrimitive = str | int | float | bool | None
+JSONValue = JSONPrimitive | list["JSONValue"] | dict[str, "JSONValue"]
+ResponseSchema = dict[str, Any]
 
 
 def _serialize_value(value: Any) -> Any:
@@ -129,6 +132,7 @@ class RLMChatCompletion:
     error: str | None = (
         None  # Set when this single call failed (e.g. in a batch); response is empty.
     )
+    parsed_response: JSONValue | None = None
 
     def to_dict(self):
         out = {
@@ -142,6 +146,8 @@ class RLMChatCompletion:
             out["metadata"] = self.metadata
         if self.error is not None:
             out["error"] = self.error
+        if self.parsed_response is not None:
+            out["parsed_response"] = self.parsed_response
         return out
 
     @classmethod
@@ -154,6 +160,7 @@ class RLMChatCompletion:
             execution_time=data.get("execution_time"),
             metadata=data.get("metadata"),
             error=data.get("error"),
+            parsed_response=data.get("parsed_response"),
         )
 
 

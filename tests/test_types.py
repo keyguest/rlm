@@ -90,6 +90,22 @@ class TestUsageSummary:
         assert summary.model_usage_summaries["gpt-4"].total_calls == 2
 
 
+class TestRLMChatCompletionStructuredResponse:
+    def test_structured_response_round_trip(self):
+        completion = RLMChatCompletion(
+            root_model="test-model",
+            prompt="test",
+            response='{"answer": 42}',
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=0.1,
+            parsed_response={"answer": 42},
+        )
+
+        restored = RLMChatCompletion.from_dict(completion.to_dict())
+
+        assert restored.parsed_response == {"answer": 42}
+
+
 class TestREPLResult:
     """Tests for REPLResult."""
 

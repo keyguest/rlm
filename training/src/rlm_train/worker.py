@@ -151,6 +151,7 @@ class Worker:
             except ValueError:
                 exec_timeout_s = 600.0
         self.exec_timeout_s = exec_timeout_s
+        self._url_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._lock = threading.Lock()
         self._last_final_answer: str | None = None
         self._context_count = 0
@@ -164,8 +165,8 @@ class Worker:
         self.globals["SHOW_VARS"] = self._show_vars
         self.globals["llm_query"] = self._llm_query
         self.globals["llm_query_batched"] = self._llm_query_batched
-        self.globals["rlm_query"] = self._llm_query
-        self.globals["rlm_query_batched"] = self._llm_query_batched
+        self.globals["rlm_query"] = self._rlm_query
+        self.globals["rlm_query_batched"] = self._rlm_query_batched
         self.locals["answer"] = _AnswerDict(on_ready=self._capture_answer)
 
     def _restore_scaffold(self) -> None:
@@ -175,9 +176,9 @@ class Worker:
             elif name == "llm_query_batched":
                 self.globals["llm_query_batched"] = self._llm_query_batched
             elif name == "rlm_query":
-                self.globals["rlm_query"] = self._llm_query
+                self.globals["rlm_query"] = self._rlm_query
             elif name == "rlm_query_batched":
-                self.globals["rlm_query_batched"] = self._llm_query_batched
+                self.globals["rlm_query_batched"] = self._rlm_query_batched
             elif name == "SHOW_VARS":
                 self.globals["SHOW_VARS"] = self._show_vars
             elif name == "answer":
@@ -216,7 +217,7 @@ class Worker:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with self._url_opener.open(req, timeout=600) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
@@ -267,6 +268,51 @@ class Worker:
         if not isinstance(responses, list) or len(responses) != len(prompts):
             return ["Error: malformed batched response"] * len(prompts)
         return [r if isinstance(r, str) else f"Error: {r}" for r in responses]
+
+    def _rlm_query(
+        self,
+        prompt: str,
+        model: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+    ) -> Any:
+        del model
+        if response_schema is None:
+            return self._llm_query(prompt)
+        result = self._proxy_post(
+            "llm_query",
+            {"prompt": prompt, "response_schema": response_schema, "depth": self.depth},
+        )
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+        if "parsed_response" not in result:
+            raise RuntimeError("Malformed structured sub-RLM response")
+        return result["parsed_response"]
+
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        if response_schema is None:
+            return self._llm_query_batched(prompts, model)
+        if not prompts:
+            return []
+        del model
+        result = self._proxy_post(
+            "llm_query_batched",
+            {
+                "prompts": list(prompts),
+                "response_schema": response_schema,
+                "depth": self.depth,
+            },
+        )
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+        responses = result.get("parsed_responses")
+        if not isinstance(responses, list) or len(responses) != len(prompts):
+            raise RuntimeError("Malformed structured batched sub-RLM response")
+        return responses
 
     def load_context(self, payload: Any, index: int | None = None) -> int:
         if index is None:

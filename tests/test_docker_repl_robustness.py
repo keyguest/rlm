@@ -75,6 +75,12 @@ def _completion(response: str, model: str | None = None) -> RLMChatCompletion:
     )
 
 
+def _structured_completion(value) -> RLMChatCompletion:
+    result = _completion(str(value))
+    result.parsed_response = value
+    return result
+
+
 def make_repl(subcall_fn=None, with_handler=True, **kwargs):
     """Create a DockerREPL (optionally) wired to an EchoLM handler."""
     from rlm.environments.docker_repl import DockerREPL
@@ -192,6 +198,61 @@ class TestRLMQuery:
         try:
             repl.execute_code("rlm_query('task', model='custom-1')")
             assert seen["model"] == "custom-1"
+        finally:
+            teardown_repl(repl)
+
+    def test_structured_rlm_query_returns_python_value(self):
+        seen = {}
+
+        def structured_subcall(prompt, response_schema, model):
+            seen.update(prompt=prompt, schema=response_schema, model=model)
+            return _structured_completion({"label": "entity", "count": 3})
+
+        schema = {
+            "title": "Classification",
+            "description": "A label and count.",
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "The exact label."},
+                "count": {"type": "integer", "description": "The exact count."},
+            },
+            "required": ["label", "count"],
+            "additionalProperties": False,
+        }
+        repl = make_repl(structured_subcall_fn=structured_subcall)
+        try:
+            result = repl.execute_code(
+                f"schema = {schema!r}\n"
+                "value = rlm_query('task', model='child', response_schema=schema)\n"
+                "print(value['label'], value['count'])"
+            )
+            assert result.stderr == ""
+            assert result.stdout.strip() == "entity 3"
+            assert seen == {"prompt": "task", "schema": schema, "model": "child"}
+            assert len(result.rlm_calls) == 1
+        finally:
+            teardown_repl(repl)
+
+    def test_structured_rlm_query_failure_raises_in_container(self):
+        def structured_subcall(prompt, response_schema, model):
+            raise ValueError("bad structured child output")
+
+        schema = {
+            "title": "Value",
+            "description": "One exact value.",
+            "type": "object",
+            "properties": {
+                "value": {"type": "string", "description": "The exact value."},
+            },
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+        repl = make_repl(structured_subcall_fn=structured_subcall)
+        try:
+            result = repl.execute_code(
+                f"schema = {schema!r}\nvalue = rlm_query('task', response_schema=schema)"
+            )
+            assert "bad structured child output" in result.stderr
         finally:
             teardown_repl(repl)
 

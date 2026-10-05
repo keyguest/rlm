@@ -9,9 +9,10 @@ from datetime import datetime
 from typing import Any
 
 import dateutil.parser
-import rlm_train
 import verifiers as vf
 from datasets import Dataset, load_dataset
+
+import rlm_train
 
 COMPARISON_PHRASES = ("more common than", "less common than", "same frequency as")
 

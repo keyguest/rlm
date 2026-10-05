@@ -71,3 +71,19 @@ class CancellationError(Exception):
     def __init__(self, partial_answer: str | None = None, message: str | None = None):
         self.partial_answer = partial_answer
         super().__init__(message or "Execution cancelled by user")
+
+
+class StructuredOutputError(Exception):
+    """Base error for structured RLM response contracts."""
+
+
+class StructuredSchemaError(StructuredOutputError):
+    """Raised when a response schema is invalid or insufficiently documented."""
+
+
+class StructuredOutputParseError(StructuredOutputError):
+    """Raised when a model response is not exactly one JSON value."""
+
+
+class StructuredOutputValidationError(StructuredOutputError):
+    """Raised when parsed JSON does not satisfy its response schema."""

@@ -11,6 +11,12 @@ from typing import Any
 
 from aiohttp import web
 
+from rlm.core.types import ResponseSchema
+from rlm.utils.structured_output import (
+    build_structured_output_instruction,
+    parse_and_validate_response,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -142,8 +148,15 @@ class SubLLMProxy:
         if prompt is None:
             return web.json_response({"error": "missing 'prompt'"}, status=400)
         model = body.get("model") or handle.model
+        response_schema = body.get("response_schema")
         try:
-            text, meta = await self._completion(handle, prompt, model)
+            completion_prompt = _with_response_schema(prompt, response_schema)
+            text, meta = await self._completion(handle, completion_prompt, model)
+            parsed_response = (
+                parse_and_validate_response(text, response_schema)
+                if response_schema is not None
+                else None
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("sub-llm call failed")
             return web.json_response({"error": str(e)})
@@ -152,7 +165,10 @@ class SubLLMProxy:
                 handle.record_call({"model": model, "prompt": prompt, "response": text, **meta})
             except Exception:
                 logger.exception("record_call failed")
-        return web.json_response({"response": text, **meta})
+        result = {"response": text, **meta}
+        if response_schema is not None:
+            result["parsed_response"] = parsed_response
+        return web.json_response(result)
 
     async def _handle_batched(self, request: web.Request) -> web.Response:
         rollout_id = request.match_info["rollout_id"]
@@ -167,6 +183,12 @@ class SubLLMProxy:
         if not isinstance(prompts, list):
             return web.json_response({"error": "missing 'prompts' list"}, status=400)
         model = body.get("model") or handle.model
+        response_schema = body.get("response_schema")
+
+        if response_schema is not None:
+            return await self._handle_structured_batched(
+                rollout_id, handle, prompts, model, response_schema
+            )
 
         if handle.fake_query_batched is not None:
             try:
@@ -208,6 +230,37 @@ class SubLLMProxy:
 
         results = await asyncio.gather(*(run_one(p) for p in prompts))
         return web.json_response({"responses": results})
+
+    async def _handle_structured_batched(
+        self,
+        rollout_id: str,
+        handle: ClientHandle,
+        prompts: list[str],
+        model: str,
+        response_schema: ResponseSchema,
+    ) -> web.Response:
+        sem = self._semaphores.get(rollout_id) or asyncio.Semaphore(handle.max_concurrent)
+
+        async def run_one(prompt: str) -> Any:
+            async with sem:
+                structured_prompt = _with_response_schema(prompt, response_schema)
+                text, meta = await self._completion(handle, structured_prompt, model)
+                parsed = parse_and_validate_response(text, response_schema)
+                if handle.record_call is not None:
+                    try:
+                        handle.record_call(
+                            {"model": model, "prompt": prompt, "response": text, **meta}
+                        )
+                    except Exception:
+                        logger.exception("record_call failed")
+                return parsed
+
+        try:
+            results = await asyncio.gather(*(run_one(prompt) for prompt in prompts))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("structured sub-llm batched call failed")
+            return web.json_response({"error": str(e)})
+        return web.json_response({"parsed_responses": results})
 
     async def _completion(
         self,
@@ -256,3 +309,12 @@ class SubLLMProxy:
                 "total_tokens": getattr(usage, "total_tokens", None),
             }
         return content, meta
+
+
+def _with_response_schema(prompt: str | list, response_schema: ResponseSchema | None) -> str | list:
+    if response_schema is None:
+        return prompt
+    instruction = build_structured_output_instruction(response_schema).strip()
+    if isinstance(prompt, str):
+        return f"{instruction}\n\nTASK\n{prompt}"
+    return [{"role": "system", "content": instruction}, *prompt]
