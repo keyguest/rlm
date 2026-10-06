@@ -1432,6 +1432,7 @@ dependencies = [
     { name = "datasets" },
     { name = "python-dateutil" },
     { name = "rlm-train" },
+    { name = "rlms" },
     { name = "verifiers" },
 ]
 
@@ -1440,6 +1441,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0" },
     { name = "python-dateutil" },
     { name = "rlm-train", editable = "../../" },
+    { name = "rlms", editable = "../../../" },
     { name = "verifiers", specifier = "==0.1.11" },
 ]
 

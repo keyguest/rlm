@@ -162,6 +162,7 @@ def _build_dataset(
 
 def load_environment(
     *,
+    engine: str = "train",
     dataset_name: str = "trec_coarse",
     min_ctx: int = 1024,
     max_ctx: int = 4096,
@@ -169,11 +170,19 @@ def load_environment(
     seed: int = 42,
     exclude_numeric: bool = False,
     max_iterations: int = 12,
+    max_depth: int = 1,
+    max_concurrent_subcalls: int = 4,
+    require_recursive_subcall: bool = False,
     sub_max_tokens: int = 4096,
     min_iterations: int = 2,
     min_subcall: int = 1,
     **kwargs: Any,
 ) -> vf.Environment:
+    if engine not in {"train", "core"}:
+        raise ValueError("engine must be either 'train' or 'core'")
+    if engine == "train" and max_depth != 1:
+        raise ValueError("max_depth is only supported with engine='core'")
+
     dataset = _build_dataset(
         dataset_name=dataset_name,
         min_ctx=min_ctx,
@@ -182,6 +191,25 @@ def load_environment(
         seed=seed,
         exclude_numeric=exclude_numeric,
     )
+    if engine == "core":
+        from oolong.core_env import CoreRLMEnv, CoreRLMRubric
+
+        core_rubric = CoreRLMRubric(
+            correctness=_score,
+            weight=1.0,
+            min_iterations=min_iterations,
+            min_subcall=min_subcall,
+        )
+        return CoreRLMEnv(
+            dataset=dataset,
+            rubric=core_rubric,
+            max_depth=max_depth,
+            max_iterations=max_iterations,
+            max_concurrent_subcalls=max_concurrent_subcalls,
+            require_recursive_subcall=require_recursive_subcall,
+            sub_max_tokens=sub_max_tokens,
+            **kwargs,
+        )
     rubric = rlm_train.RLMTrainRubric(
         correctness=_score,
         weight=1.0,
