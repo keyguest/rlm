@@ -125,6 +125,7 @@ def test_load_environment_selects_core_engine(monkeypatch: pytest.MonkeyPatch) -
         max_iterations=7,
         max_concurrent_subcalls=2,
         require_recursive_subcall=True,
+        sub_model="gpt-5-mini",
     )
 
     assert isinstance(env, CoreRLMEnv)
@@ -132,6 +133,7 @@ def test_load_environment_selects_core_engine(monkeypatch: pytest.MonkeyPatch) -
     assert env.max_iterations == 7
     assert env.max_concurrent_subcalls == 2
     assert env.require_recursive_subcall is True
+    assert env.sub_model == "gpt-5-mini"
 
 
 def test_train_engine_rejects_recursive_depth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -140,6 +142,8 @@ def test_train_engine_rejects_recursive_depth(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ValueError, match="engine='core'"):
         oolong_env.load_environment(engine="train", max_depth=2)
+    with pytest.raises(ValueError, match="sub_model"):
+        oolong_env.load_environment(engine="train", sub_model="gpt-5-mini")
 
 
 def test_core_env_builds_depth_limited_recursive_rlm(
@@ -153,6 +157,7 @@ def test_core_env_builds_depth_limited_recursive_rlm(
         rubric=vf.Rubric(),
         max_depth=3,
         require_recursive_subcall=True,
+        sub_model="gpt-5-mini",
     )
 
     rlm = env.build_rlm("test-model", {"max_tokens": 512, "n": 1})
@@ -161,6 +166,9 @@ def test_core_env_builds_depth_limited_recursive_rlm(
         assert rlm.backend_kwargs["api_key"] == "test-key"
         assert rlm.backend_kwargs["base_url"] == "https://relay.example/v1"
         assert rlm.backend_kwargs["sampling_args"]["max_tokens"] == 512
+        assert rlm.sub_model == "gpt-5-mini"
+        assert rlm.other_backend_kwargs is not None
+        assert rlm.other_backend_kwargs[0]["model_name"] == "gpt-5-mini"
         assert "Recursive evaluation requirement" in rlm.system_prompt
     finally:
         rlm.close()

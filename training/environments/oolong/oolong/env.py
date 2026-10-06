@@ -174,6 +174,7 @@ def load_environment(
     max_concurrent_subcalls: int = 4,
     require_recursive_subcall: bool = False,
     sub_max_tokens: int = 4096,
+    sub_model: str | None = None,
     min_iterations: int = 2,
     min_subcall: int = 1,
     **kwargs: Any,
@@ -182,6 +183,8 @@ def load_environment(
         raise ValueError("engine must be either 'train' or 'core'")
     if engine == "train" and max_depth != 1:
         raise ValueError("max_depth is only supported with engine='core'")
+    if engine == "train" and sub_model is not None:
+        raise ValueError("sub_model is only supported with engine='core'")
 
     dataset = _build_dataset(
         dataset_name=dataset_name,
@@ -208,6 +211,7 @@ def load_environment(
             max_concurrent_subcalls=max_concurrent_subcalls,
             require_recursive_subcall=require_recursive_subcall,
             sub_max_tokens=sub_max_tokens,
+            sub_model=sub_model,
             **kwargs,
         )
     rubric = rlm_train.RLMTrainRubric(

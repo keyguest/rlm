@@ -228,8 +228,10 @@ class TestRLMMetadata:
             backend_kwargs={"api_key": "secret"},
             environment_type="local",
             environment_kwargs={},
+            sub_model="gpt-5-mini",
         )
         d = meta.to_dict()
         assert d["root_model"] == "gpt-4"
         assert d["max_depth"] == 2
         assert d["backend"] == "openai"
+        assert d["sub_model"] == "gpt-5-mini"

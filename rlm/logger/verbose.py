@@ -82,6 +82,7 @@ class VerbosePrinter:
         max_iterations: int,
         max_depth: int,
         other_backends: list[str] | None = None,
+        sub_model: str | None = None,
     ) -> None:
         """Print the initial RLM configuration header."""
         if not self.enabled:
@@ -119,11 +120,13 @@ class VerbosePrinter:
             Text(str(max_iterations), style=STYLE_WARNING),
         )
 
-        if other_backends:
-            backends_text = Text(", ".join(other_backends), style=STYLE_SECONDARY)
+        if sub_model or other_backends:
+            sub_models_text = Text(
+                sub_model or ", ".join(other_backends or []), style=STYLE_SECONDARY
+            )
             config_table.add_row(
                 "Sub-models",
-                backends_text,
+                sub_models_text,
                 "Max Depth",
                 Text(str(max_depth), style=STYLE_WARNING),
             )
@@ -163,6 +166,7 @@ class VerbosePrinter:
             max_iterations=metadata.max_iterations,
             max_depth=metadata.max_depth,
             other_backends=other,
+            sub_model=metadata.sub_model,
         )
 
     def print_iteration_start(self, iteration: int) -> None:

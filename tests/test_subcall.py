@@ -355,6 +355,134 @@ class TestSubcallModelOverride:
             parent.close()
 
 
+class TestDefaultSubcallModel:
+    """Tests for declarative root/sub-model separation."""
+
+    def test_sub_model_configures_same_backend_client(self):
+        parent = RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "gpt-5", "api_key": "test-key"},
+            sub_model="gpt-5-mini",
+            sub_sampling_args={"max_tokens": 512},
+        )
+
+        assert parent.sub_model == "gpt-5-mini"
+        assert parent.other_backends == ["openai"]
+        assert parent.other_backend_kwargs is not None
+        assert parent.other_backend_kwargs[0]["model_name"] == "gpt-5-mini"
+        assert parent.other_backend_kwargs[0]["api_key"] == "test-key"
+        assert parent.other_backend_kwargs[0]["sampling_args"]["max_tokens"] == 512
+
+    def test_sub_model_rejects_ambiguous_other_backend(self):
+        try:
+            RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "gpt-5"},
+                sub_model="gpt-5-mini",
+                other_backends=["anthropic"],
+                other_backend_kwargs=[{"model_name": "claude"}],
+            )
+        except ValueError as exc:
+            assert "cannot be combined" in str(exc)
+        else:
+            raise AssertionError("Expected conflicting sub-model configuration to fail")
+
+    def test_complete_child_rlm_uses_sub_model(self):
+        captured_child_params = {}
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm([final("answer")])
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "gpt-5", "api_key": "test-key"},
+                sub_model="gpt-5-mini",
+                max_depth=3,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt")
+
+        assert captured_child_params["backend"] == "openai"
+        assert captured_child_params["backend_kwargs"]["model_name"] == "gpt-5-mini"
+        assert captured_child_params["backend_kwargs"]["api_key"] == "test-key"
+
+    def test_cross_backend_complete_child_uses_other_backend(self):
+        captured_child_params = {}
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm([final("answer")])
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "gpt-5"},
+                other_backends=["anthropic"],
+                other_backend_kwargs=[{"model_name": "claude-sonnet"}],
+                max_depth=3,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt")
+
+        assert captured_child_params["backend"] == "anthropic"
+        assert captured_child_params["backend_kwargs"]["model_name"] == "claude-sonnet"
+
+    def test_explicit_model_override_wins_over_sub_model(self):
+        captured_child_params = {}
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm([final("answer")])
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "gpt-5"},
+                sub_model="gpt-5-mini",
+                max_depth=3,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt", model="gpt-5-nano")
+
+        assert captured_child_params["backend"] == "openai"
+        assert captured_child_params["backend_kwargs"]["model_name"] == "gpt-5-nano"
+
+    def test_leaf_call_uses_sub_model(self):
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm(
+                ["leaf response"], model_name="gpt-5-mini"
+            )
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "gpt-5"},
+                sub_model="gpt-5-mini",
+                depth=1,
+                max_depth=2,
+            )
+
+            result = parent._subcall("test prompt")
+
+        backend, backend_kwargs = mock_get_client.call_args.args
+        assert backend == "openai"
+        assert backend_kwargs["model_name"] == "gpt-5-mini"
+        assert result.root_model == "gpt-5-mini"
+        assert result.response == "leaf response"
+
+
 class TestSubcallModelOverrideAtLeafDepth:
     """Tests for model override at max_depth (leaf LM completion)."""
 

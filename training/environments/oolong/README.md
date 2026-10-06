@@ -28,7 +28,7 @@ uv run vf-eval oolong \
   -r 1 \
   -s \
   --state-columns rlm_metadata,rlm_usage_summary \
-  -a '{"engine":"core","dataset_name":"trec_coarse","min_ctx":1024,"max_ctx":4096,"num_examples":5,"max_iterations":12,"max_depth":2,"max_concurrent_subcalls":4,"require_recursive_subcall":true,"sub_max_tokens":4096}'
+  -a '{"engine":"core","dataset_name":"trec_coarse","min_ctx":1024,"max_ctx":4096,"num_examples":5,"max_iterations":12,"max_depth":2,"max_concurrent_subcalls":4,"require_recursive_subcall":true,"sub_model":"gpt-5-mini","sub_max_tokens":4096}'
 ```
 
 `max_depth=2` means the root can create one full child RLM level. Use
@@ -50,10 +50,12 @@ uv run vf-eval oolong \
   -c 2 \
   -s \
   --state-columns rlm_usage_summary \
-  -a '{"engine":"core","dataset_name":"trec_coarse","min_ctx":1024,"max_ctx":4096,"num_examples":-1,"max_iterations":12,"max_depth":2,"max_concurrent_subcalls":4,"require_recursive_subcall":true,"sub_max_tokens":4096}'
+  -a '{"engine":"core","dataset_name":"trec_coarse","min_ctx":1024,"max_ctx":4096,"num_examples":-1,"max_iterations":12,"max_depth":2,"max_concurrent_subcalls":4,"require_recursive_subcall":true,"sub_model":"gpt-5-mini","sub_max_tokens":4096}'
 ```
 
 The aggregate output includes `rlm_recursive_subcalls`,
 `rlm_max_depth_reached`, `rlm_total_iterations`, and `rlm_total_repl_calls`.
 With `require_recursive_subcall=true`, a successful depth-2 rollout should report
 `rlm_recursive_subcalls >= 1` and `rlm_max_depth_reached >= 1`.
+The CLI `--model` value configures the root RLM; `sub_model` configures complete
+child RLMs, plain `llm_query()` calls, and leaf calls at the depth limit.

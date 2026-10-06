@@ -87,6 +87,7 @@ class RLM:
         sub_sampling_args: dict[str, Any] | None = None,
         orchestrator: bool = True,
         user_prologue: str | None = None,
+        sub_model: str | None = None,
     ):
         """
         Args:
@@ -104,6 +105,8 @@ class RLM:
             custom_system_prompt: The custom system prompt to use for the RLM.
             other_backends: A list of other client backends that the environments can use to make sub-calls.
             other_backend_kwargs: The kwargs to pass to the other client backends (ordered to match other_backends).
+            sub_model: Convenience model name for sub-calls on the same backend as the root.
+                Cannot be combined with other_backends or other_backend_kwargs.
             logger: The logger to use for the RLM.
             verbose: Whether to print verbose output in rich to console.
             persistent: If True, reuse the environment across completion() calls for multi-turn conversations.
@@ -134,6 +137,17 @@ class RLM:
             existing = dict(backend_kwargs.get("sampling_args") or {})
             existing.update(sampling_args)
             backend_kwargs["sampling_args"] = existing
+        if sub_model is not None:
+            if not isinstance(sub_model, str) or not sub_model.strip():
+                raise ValueError("sub_model must be a non-empty string")
+            if other_backends is not None or other_backend_kwargs is not None:
+                raise ValueError(
+                    "sub_model cannot be combined with other_backends or other_backend_kwargs"
+                )
+            sub_backend_kwargs = dict(backend_kwargs or {})
+            sub_backend_kwargs["model_name"] = sub_model
+            other_backends = [backend]
+            other_backend_kwargs = [sub_backend_kwargs]
         if sub_sampling_args is not None:
             if other_backends is None:
                 other_backends = [backend]
@@ -160,9 +174,18 @@ class RLM:
                     "We currently only support one additional backend for the recursive sub-calls! "
                     "This model will be the model used for recursive sub-calls, but this will change in the future"
                 )
+            if other_backend_kwargs is None or len(other_backend_kwargs) != len(other_backends):
+                raise ValueError(
+                    "other_backend_kwargs must contain one configuration per other backend"
+                )
 
         self.other_backends = other_backends
         self.other_backend_kwargs = other_backend_kwargs
+        self.sub_model = (
+            other_backend_kwargs[0].get("model_name")
+            if other_backends and other_backend_kwargs
+            else None
+        )
 
         # Custom tools: functions available in the REPL environment
         self.custom_tools = custom_tools
@@ -226,6 +249,7 @@ class RLM:
                 if environment_kwargs
                 else {},
                 other_backends=other_backends,
+                sub_model=self.sub_model,
             )
             if self.logger:
                 self.logger.log_metadata(metadata)
@@ -819,21 +843,28 @@ class RLM:
         """
         next_depth = self.depth + 1
 
-        # Determine which backend/kwargs to use (model override or parent's default)
-        if model is not None:
+        # Explicit model overrides win. Otherwise, use the configured sub-call backend.
+        child_backend = self.backend
+        child_backend_kwargs = dict(self.backend_kwargs or {})
+        if model is None and self.other_backends and self.other_backend_kwargs:
+            child_backend = self.other_backends[0]
+            child_backend_kwargs = dict(self.other_backend_kwargs[0])
+        elif (
+            model is not None
+            and self.other_backends
+            and self.other_backend_kwargs
+            and self.other_backend_kwargs[0].get("model_name") == model
+        ):
+            child_backend = self.other_backends[0]
+            child_backend_kwargs = dict(self.other_backend_kwargs[0])
+        elif model is not None:
             child_backend_kwargs = (self.backend_kwargs or {}).copy()
             child_backend_kwargs["model_name"] = model
-        else:
-            child_backend_kwargs = self.backend_kwargs
         resolved_model = model or (child_backend_kwargs or {}).get("model_name", "unknown")
 
         # If we'd hit/exceed the cap, do a normal LM completion (no REPL)
         if next_depth >= self.max_depth:
-            # Use other_backend if available, otherwise use main backend
-            if self.other_backends and self.other_backend_kwargs:
-                client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
-            else:
-                client = get_client(self.backend, child_backend_kwargs or {})
+            client = get_client(child_backend, child_backend_kwargs)
             root_model = model or client.model_name
             start_time = time.perf_counter()
             try:
@@ -932,7 +963,7 @@ class RLM:
 
         # Spawn a child RLM with its own LocalREPL
         child = RLM(
-            backend=self.backend,
+            backend=child_backend,
             backend_kwargs=child_backend_kwargs,
             environment=self.environment_type,
             environment_kwargs=self.environment_kwargs,

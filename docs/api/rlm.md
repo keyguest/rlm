@@ -63,6 +63,7 @@ RLM(
     on_subcall_complete: Callable | None = None,
     on_iteration_start: Callable | None = None,
     on_iteration_complete: Callable | None = None,
+    sub_model: str | None = None,
 )
 ```
 
@@ -276,7 +277,10 @@ rlm = RLM(..., custom_system_prompt=custom_prompt)
 **Type:** `list[str] | None` / `list[dict] | None`
 **Default:** `None`
 
-Register additional LM backends. The first `other_backend` is used as the default for depth-routed sub-calls (e.g. `llm_query()` calls from code at depth > 0 are routed to the other backend). Additional backends are registered by model name and can be selected explicitly.
+Register an alternate backend for sub-calls. The first `other_backend` is used
+by plain `llm_query()` calls, complete child RLMs created by `rlm_query()`, and
+leaf calls at the recursion depth limit. A `model=` argument on an individual
+call overrides this default.
 
 ```python
 rlm = RLM(
@@ -292,6 +296,20 @@ rlm = RLM(
 # llm_query(prompt)  # Routed to other_backend (Claude) at depth > 0
 # llm_query(prompt, model="gpt-4o")  # Explicit model override
 ```
+
+For the common case where root and child use the same provider, `sub_model` is
+a convenience alias:
+
+```python
+rlm = RLM(
+    backend="openai",
+    backend_kwargs={"model_name": "gpt-5"},
+    sub_model="gpt-5-mini",
+    max_depth=2,
+)
+```
+
+Do not combine `sub_model` with `other_backends` or `other_backend_kwargs`.
 
 ---
 

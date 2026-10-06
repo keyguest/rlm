@@ -140,6 +140,7 @@ This will display:
 | `custom_system_prompt` | `str` | `None` | Override default system prompt |
 | `other_backends` | `list` | `None` | Additional backends for sub-calls |
 | `other_backend_kwargs` | `list` | `None` | Configs for additional backends |
+| `sub_model` | `str` | `None` | Same-backend model used by child RLMs and sub-calls |
 | `logger` | `RLMLogger` | `None` | Logger for trajectory tracking and `metadata` capture |
 | `verbose` | `bool` | `False` | Enable console output |
 | `persistent` | `bool` | `False` | Reuse environment across `completion()` calls |

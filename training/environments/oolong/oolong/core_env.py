@@ -91,6 +91,7 @@ class CoreRLMEnv(vf.Environment):
         max_iterations: int = 12,
         max_concurrent_subcalls: int = 4,
         sub_max_tokens: int = 4096,
+        sub_model: str | None = None,
         rlm_backend: str = "openai",
         rlm_environment: str = "local",
         api_key_var: str = "OPENAI_API_KEY",
@@ -111,6 +112,8 @@ class CoreRLMEnv(vf.Environment):
             raise ValueError("max_iterations must be at least 1")
         if max_concurrent_subcalls < 1:
             raise ValueError("max_concurrent_subcalls must be at least 1")
+        if sub_model is not None and (not isinstance(sub_model, str) or not sub_model.strip()):
+            raise ValueError("sub_model must be a non-empty string")
         if require_recursive_subcall and max_depth < 2:
             raise ValueError("require_recursive_subcall requires max_depth >= 2")
         if max_depth > 1 and rlm_environment not in {"local", "ipython", "docker"}:
@@ -123,6 +126,7 @@ class CoreRLMEnv(vf.Environment):
         self.max_iterations = max_iterations
         self.max_concurrent_subcalls = max_concurrent_subcalls
         self.sub_max_tokens = sub_max_tokens
+        self.sub_model = sub_model
         self.rlm_backend = rlm_backend
         self.rlm_environment = rlm_environment
         self.api_key_var = api_key_var
@@ -179,6 +183,7 @@ class CoreRLMEnv(vf.Environment):
             max_concurrent_subcalls=self.max_concurrent_subcalls,
             sampling_args=root_sampling_args,
             sub_sampling_args={"max_tokens": self.sub_max_tokens},
+            sub_model=self.sub_model,
             logger=RLMLogger(),
             verbose=self.verbose,
         )

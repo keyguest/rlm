@@ -104,8 +104,9 @@ def get_client(self, model=None, depth=0):
     return self.default_client            # Fallback
 ```
 
-This lets you use a different (e.g. cheaper/faster) model for sub-LM calls
-by specifying `other_backends` / `other_backend_kwargs` in the RLM constructor.
+This lets you use a different (e.g. cheaper/faster) model for sub-LM calls and
+complete child RLMs by specifying `sub_model`, or by specifying
+`other_backends` / `other_backend_kwargs` for a different provider.
 
 ---
 
